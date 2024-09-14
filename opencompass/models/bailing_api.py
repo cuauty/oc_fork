@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Union
 
 import requests
 from requests.adapters import HTTPAdapter
+from retrying import retry
 from urllib3.connection import HTTPConnection
 
 from opencompass.utils.prompt import PromptList
@@ -46,8 +47,9 @@ class BaiLingAPI(BaseAPIModel):
 
     def __init__(
         self,
-        token: str,
         path: str,
+        token: str,
+        url: str,
         query_per_second: int = 1,
         max_seq_len: int = None,
         meta_template: Optional[Dict] = None,
@@ -64,6 +66,11 @@ class BaiLingAPI(BaseAPIModel):
         )
 
         self.logger.info(f"Bailing API Model Init path: {path} ")
+
+        self._headers = {"Authorization": f"Bearer {token}"}
+        self._headers["Content-Type"] = "application/json"
+        self._url = url
+        self._model = path
         self._sessions = []
         try:
             for i in range(BaiLingAPI.EXECUTOR_NUM):
@@ -76,7 +83,7 @@ class BaiLingAPI(BaseAPIModel):
             self.logger.error("Fail to setup the session. ")
             raise RuntimeError("Fail to setup the session. ")
 
-    EXECUTOR_NUM: int = 3
+    EXECUTOR_NUM: int = 2
 
     def generate(
         self,
@@ -94,79 +101,52 @@ class BaiLingAPI(BaseAPIModel):
             List[str]: A list of generated strings.
         """
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=BaiLingAPI.EXECUTOR_NUM
-        ) as executor:
-            future_to_messages = {
-                executor.submit(
-                    send_request, [data], i, conversation_name, service_url
-                ): i
-                for i, data in enumerate(total_data_list[:total_test_num])
-            }
-            for future in concurrent.futures.as_completed(future_to_messages):
-                m = future_to_messages[future]
-                result = future.result()
-                durations.append(result[1])
-                finished_test_num += 1
-                succ_test_num += 1 if result[2] else 0
-                # if finished_test_num % 10 == 0:
-                if finished_test_num % 10 == 0:
-                    print(f"====={m}: duration={result[1]} result={result[0]}")
-        end_point = time.perf_counter()
+        # with concurrent.futures.ThreadPoolExecutor(
+        #     max_workers=BaiLingAPI.EXECUTOR_NUM
+        # ) as executor:
+        #     future_to_messages = {
+        #         executor.submit(
+        #             self.send_request, [data], i, conversation_name, service_url
+        #         ): i
+        #         for i, data in enumerate(total_data_list[:total_test_num])
+        #     }
+        #     for future in concurrent.futures.as_completed(future_to_messages):
+        #         m = future_to_messages[future]
+        #         result = future.result()
+        #         finished_test_num += 1
+        #         succ_test_num += 1 if result[2] else 0
+        #         if finished_test_num % 10 == 0:
+        #             print(f"====={m}: duration={result[1]} result={result[0]}")
+        # end_point = time.perf_counter()
 
-        with ThreadPoolExecutor(1) as executor:
+        with concurrent.futures.ThreadPoolExecutor(BaiLingAPI.EXECUTOR_NUM) as executor:
             results = list(
-                executor.map(self._generate, inputs, [max_out_len] * len(inputs))
+                executor.map(
+                    self._generate,
+                    self._sessions,
+                    inputs,
+                    [max_out_len] * len(inputs),
+                )
             )
         self.flush()
         return results
 
-    def bailing_infer(
-        self,
-        query,
-    ):
-        try:
-            chat_completion = self.client.chat.completions.create(
-                model=self.path,
-                messages=query,
-                temperature=0.4,
-                code={"max_output_len": 8192},
-                maths={
-                    "out_seq_length": 8192,
-                    "temperature": 0.5,
-                    "top_p": 0.9,
-                    "do_sample": False,
-                },
-            )
-            return chat_completion.choices[0].message.content, chat_completion.id
-
-        except Exception as e:
-            self.logger.error(
-                "infer error, query=%s; model_name=%s;  error=%s",
-                query,
-                self.path,
-                traceback.format_exc(),
-            )
-            raise e
-
     def _generate(
         self,
+        sess,
         input: Union[str, PromptList],
-        max_out_len: int = 512,
+        max_out_len: int,
     ) -> str:
         """Generate results given an input.
 
         Args:
             inputs (str or PromptList): A string or PromptDict.
-                The PromptDict should be organized in OpenCompass'
-                API format.
+                The PromptDict should be organized in OpenCompass' API format.
             max_out_len (int): The maximum length of the output.
 
         Returns:
             str: The generated string.
         """
-        assert isinstance(input, (str, PromptList))
-
         if isinstance(input, str):
             messages = [{"role": "user", "content": input}]
         else:
@@ -175,31 +155,32 @@ class BaiLingAPI(BaseAPIModel):
                 content = item["prompt"]
                 if not content:
                     continue
-                msg = {"content": content}
+                message = {"content": content}
                 if item["role"] == "HUMAN":
-                    msg["role"] = "user"
+                    message["role"] = "user"
                 elif item["role"] == "BOT":
-                    msg["role"] = "assistant"
+                    message["role"] = "assistant"
                 elif item["role"] == "SYSTEM":
-                    msg["role"] = "system"
-                messages.append(msg)
+                    message["role"] = "system"
+                else:
+                    message["role"] = "user"
+                messages.append(message)
+        request = {"model": self._model, "messages": messages}
+        try:
+            self._inference(request, sess)
+        except Exception as e:
+            self.logger.error(
+                f"Fail to inference request={request}; model_name={self.path};  error={traceback.format_exc()}"
+            )
+            raise e
 
-        max_num_retries = 0
-        while max_num_retries < self.retry:
-            try:
-
-                response, bailing_trace_id = self.bailing_infer(
-                    messages,
-                )
-                self.logger.info(
-                    f"input: {messages}, response: {response}, bailing_trace_id: {bailing_trace_id}"
-                )
-                return response
-
-            except Exception as err:
-                print("Request Error:{}".format(err), flush=True)
-                time.sleep(1)
-                max_num_retries += 1
-                continue
-
-        return ""
+    @retry(stop_max_attempt_number=3, wait_fixed=16000)  # ms
+    def _inference(self, request, sess):
+        response = sess.request(
+            "POST",
+            self._url,
+            json=request,
+            headers=self._headers,
+            timeout=500,
+        )
+        return response
